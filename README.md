@@ -1,310 +1,472 @@
 # ARONA
 
-**Accelerator-aware Rewriting and Operator-compatible Neural Adaptation**  
-가속기 인지형 연산자 변환 및 신경망 적응
+**Accelerator-aware Rewriting and Operator-compatible Neural Adaptation**
 
-> 대상 엣지 장치 또는 장치에 연결된 개발 PC에서 하드웨어와 컴파일러를 자동으로 인식하고, ONNX 모델의 미지원 연산·CPU fallback·메모리 및 배포 제약을 분석해 안전한 최적화 방안을 적용하는 로컬 도구
+ARONA는 실제 제조사 컴파일러 결과를 바탕으로 ONNX 모델의 가속기 배치와 메모리 적합성을 분석하고, 펌웨어 생성부터 보드 프로그래밍 및 실기기 검증까지 하나의 CLI로 자동화하는 하드웨어 인지형 오픈소스 도구입니다. MVP에서는 NUCLEO-N657X0-Q를 대상으로 외부 테스트 모델인 MobileNetV2와 YOLO26n의 분석·배포를 검증했습니다.
 
 > [!NOTE]
-> 현재 저장소는 2026년 8월 checkpoint 4 제출 후보 기준의 MVP 구현 상태를 설명합니다. 실제 보드 evidence와 모델 binary는 라이선스·용량 때문에 Git에 포함하지 않고, checksum·명령·fixture·재생성 절차로 관리합니다.
-
-## 문제 정의
-
-GPU에서 정상적으로 실행되는 모델도 엣지 NPU에서는 다음과 같은 이유로 일부 또는 전체가 가속되지 않을 수 있습니다.
-
-- 대상 가속기가 모델의 연산자를 지원하지 않음
-- 연산자는 지원하지만 shape, layout, datatype 또는 attribute 제약을 위반함
-- 미지원 연산이 CPU fallback을 발생시킴
-- 모델이 여러 NPU/CPU subgraph로 분할되어 tensor 전송 비용이 증가함
-- 개별 연산자는 지원되지만 compiler fusion이나 정렬 조건을 만족하지 못함
-- compiler memory profile이 실제 보드에 없는 RAM을 사용하거나, 필요한 연속 activation buffer를 확보하지 못함
-- 모델 weight, activation, application code 및 runtime이 같은 SRAM 영역을 두고 경쟁함
-- 모델 compile에는 성공했지만 link, image signing, programming, device initialization 또는 inference 단계에서 실패함
-
-제조사 compiler는 일반적으로 지원되는 구간을 가속기에 배치하고 나머지를 CPU에 남깁니다. ARONA는 compiler 결과와 실제 보드 자원을 함께 분석하고, 문제 원인이 모델 그래프인지 배포 환경인지 구분합니다. 모델 문제에는 가속기 친화적인 graph rewrite를 적용하고, 자원 문제에는 유효한 memory placement 방향을 제시한 뒤 재컴파일과 target validation으로 실제 개선 여부를 확인합니다.
-
-## MVP 목표
-
-사용자는 대상 제조사의 변환 명령을 직접 구성하지 않고 ONNX 모델 하나를 입력합니다.
-
-```bash
-arona optimize model.onnx
-```
-
-ARONA는 실행 중인 엣지 장치 또는 연결된 개발 환경에서 사용 가능한 장치, SDK, runtime 및 compiler를 탐지하고 다음 과정을 수행합니다.
-
-```mermaid
-flowchart TD
-    A["ONNX 모델 입력"] --> B["보드·SDK·compiler·memory map 탐지"]
-    B --> C["baseline compile·link·target 실행"]
-    C --> D["fallback·partition·memory·실패 단계 분석"]
-    D --> E{"안전한 개선 후보가 있는가?"}
-    E -- "모델 그래프" --> F["exact operator/graph rewrite"]
-    E -- "배포 자원" --> G["resource-safe 배치 방향 제시"]
-    F --> H["출력 동등성 검증"]
-    G --> I["보드 적합성 검증"]
-    H --> J["재컴파일·재배포·재측정"]
-    I --> J
-    J --> K{"실제로 개선됐는가?"}
-    K -- "예" --> L["변환 모델·배포 산출물·보고서 출력"]
-    K -- "아니요" --> M["원복 후 기존 실행 계획 유지"]
-    E -- "없음" --> M
-    M --> L
-```
-
-ARONA의 목표는 CPU fallback을 무조건 제거하는 것이 아닙니다. rewrite가 정확도, latency 또는 전송 비용 측면에서 불리하다면 기존 CPU fallback을 유지하고 그 근거를 보고합니다.
-
-## 실행 환경
-
-ARONA는 다음 두 환경을 지원하는 구조로 개발합니다.
-
-1. **On-device**: ARONA를 엣지 장치에서 직접 실행
-2. **Host-connected**: vendor SDK/compiler가 설치된 개발 PC에서 연결된 엣지 장치를 대상으로 실행
-
-사용자가 target을 매번 지정하는 방식이 아니라 현재 환경을 자동 탐지하는 것을 기본으로 합니다. 여러 장치가 발견되거나 자동 탐지가 실패한 경우에만 target override를 사용합니다.
-
-```bash
-arona optimize model.onnx --target <backend-name>
-```
-
-## 최적화 의사결정
-
-각 문제 연산 또는 subgraph는 다음 순서로 처리합니다.
-
-1. **Native execution**: 대상 가속기에서 그대로 실행
-2. **Exact rewrite**: 의미적으로 동등한 지원 연산자 조합으로 치환
-3. **Neural adaptation**: 데이터가 있을 때 근사 구조로 치환하고 fine-tuning 또는 distillation 수행
-4. **CPU fallback**: 안전한 변환이 없거나 변환 이득이 없으면 해당 구간만 CPU에 유지
-
-예를 들어 대상 가속기가 `SiLU`는 지원하지 않지만 `Sigmoid`와 `Mul`을 지원한다면 다음과 같은 exact rewrite 후보를 적용할 수 있습니다.
-
-```text
-SiLU(x)  →  x * Sigmoid(x)
-```
-
-rewrite는 대체 그래프의 모든 연산자가 현재 장치에서 지원되고, 출력 동등성 검증을 통과한 경우에만 채택합니다.
-
-CPU fallback 여부는 노드 개수만으로 판단하지 않습니다. 다음 정보를 함께 비교합니다.
-
-- 가속기에서 실행되는 subgraph 비율
-- NPU/CPU partition 수
-- NPU와 CPU 사이의 전환 횟수
-- 경계 tensor의 shape와 예상 전송량
-- rewrite로 추가되는 연산 비용
-- 원본 대비 출력 오차 또는 task accuracy 변화
-- 실제 compiler의 성공 여부와 profiling 결과
+> ARONA는 특정 AI 모델을 내장하거나 배포하는 프로젝트가 아닙니다. MobileNetV2와 YOLO26n은 E2E 기능 검증을 위한 외부 입력이며, 모델 바이너리는 라이선스와 용량 문제로 Git에 포함하지 않습니다. 출처, 라이선스, SHA-256과 다운로드 절차는 [`models/manifest.json`](models/manifest.json)으로 관리합니다.
 
 ## MVP 범위
 
-### 필수 기능
-
-- ONNX 모델 입력, 유효성 검사 및 shape inference
-- 현재 장치, SDK, runtime 및 compiler 자동 탐지
-- NUCLEO-N657X0-Q board profile과 실제 memory map 검사
-- 원본 모델 baseline compile, link 및 target validation 단계 기록
-- compiler 로그에서 미지원 노드, CPU fallback 및 graph partition 추출
-- ONNX graph node와 compiler 분석 결과 연결
-- 실패를 parse, optimize, partition, codegen, memory scheduling, link, signing, programming, initialization, inference 및 validation 단계로 분류
-- compiler memory pool과 실제 보드 memory region의 존재 여부, 범위 및 중첩 검사
-- weight, activation, application code, `.rodata`, `.data`, `.bss`, heap 및 stack의 storage class별 배치 분석
-- total/CPU/NPU activation, 가장 큰 연속 buffer 및 memory bank별 사용량 보고
-- 실제 target latency와 compiler가 보고한 memory 사용량 수집
-- exact operator/graph rewrite 최소 2개
-- rewrite 후 자동 재컴파일·target validation 및 결과 비교
-- ONNX Runtime 기반 출력 동등성 검증
-- 개선되지 않은 rewrite의 자동 원복
-- 변환할 수 없는 구간의 CPU fallback 표시
-- 원본/변환 모델의 호환성, 자원 적합성 및 성능 비교 보고서
-- 일관된 진행 상태·오류·요약을 제공하는 터미널 CLI
-- 공통 `BackendAdapter` 인터페이스
-- ST Neural-ART용 `stedgeai` backend adapter
-
-### 시간이 허용되면 포함
-
-- 근사 operator replacement 1개
-- calibration 또는 fine-tuning을 통한 정확도 복구
-- runtime peak memory 계측(보드와 runtime이 지원하는 경우)
-- 두 번째 backend용 예제 adapter
-
-선택 기능은 필수 기능의 end-to-end pipeline이 안정화된 뒤에만 착수합니다.
-
-## 출력 산출물
-
-최적화 실행 결과는 다음을 포함합니다.
-
-```text
-outputs/<run-id>/
-├── original-analysis.json
-├── run-report.json
-├── deployment-analysis.json
-├── optimized-model.onnx
-├── optimized-analysis.json
-├── rewrite-history.json
-├── postprocess.json
-├── compiler/
-├── deployment/
-├── validation.json
-└── report.md
-```
-
-- 최적화된 ONNX 모델
-- backend가 생성한 배포용 산출물
-- 미지원 연산 및 backend 배치 결과
-- CPU fallback과 graph partition 정보
-- 실제 보드 memory map과 compiler memory pool의 적합성
-- storage class별 배치, activation peak 및 가장 큰 연속 buffer
-- compile부터 target validation까지 단계별 상태와 최초 오류
-- 적용·거절·원복된 rewrite 이력과 사유
-- 출력 동등성 검증 결과
-- 원본 대비 latency 및 memory 결과(측정 가능한 경우)
-- 재현에 필요한 장치, SDK, compiler 및 설정 정보
-
-## 기술 스택
-
-| 영역 | 언어·도구 |
+| 항목 | 현재 구현 및 검증 범위 |
 | --- | --- |
-| 주 언어 | Python 3.11+ |
-| 모델 그래프 | ONNX, ONNX Runtime, NumPy |
-| 선택적 신경망 적응 | PyTorch |
-| CLI | Typer |
-| 설정·스키마 | Pydantic, YAML/JSON |
-| 사용자 인터페이스 | Typer 기반 terminal CLI |
-| 보고서 | JSON, Markdown 및 terminal table |
-| 테스트 | pytest |
-| 코드 품질 | Ruff, pre-commit |
-| 하드웨어 연동 | vendor SDK/compiler를 호출하는 backend adapter |
-| MVP backend | ST Edge AI Core / `stedgeai`, STM32Cube toolchain, ST-LINK |
+| 타깃 보드 | STMicroelectronics NUCLEO-N657X0-Q |
+| 가속기 | ST Neural-ART NPU |
+| 검증 호스트 | Windows x64, PowerShell |
+| 제조사 backend | ST Edge AI Core 4.0.1의 `stedgeai` |
+| 외부 테스트 모델 | MobileNetV2 0.35 Food-101 128×128 ONNX QDQ, YOLO26n COCO-Person 256×256 ONNX QDQ Int8 |
+| 입력 방식 | 카메라 없이 재현 가능한 fixed-input 실기기 추론 |
+| 배포 흐름 | 환경 점검 → 컴파일러 분석 → 후보 검증 → generate → build/sign → program → UART validate |
+| 결과물 | JSON·Markdown 분석 보고서, 컴파일러 및 배포 로그, 체크섬, UART 실측 증거 |
 
-## MVP primary backend
+현재 MVP는 지원 보드와 backend를 의도적으로 하나로 제한해 “ONNX 입력부터 실제 보드 실행 증거까지”의 수직형 E2E 파이프라인을 완성하는 데 집중했습니다. 다른 보드와 모델을 자동으로 지원하거나 자동 경량화를 수행하는 기능은 향후 확장 목표입니다.
 
-Sprint 0의 primary target은 **ST NUCLEO-N657X0-Q의 Neural-ART accelerator**이며,
-`stedgeai` CLI를 첫 `BackendAdapter`로 구현합니다. 실제 연구실 개발 PC의 compiler, SDK,
-ST-LINK firmware, board revision과 boot mode는 probe/evidence 문서와 fixture metadata로
-고정합니다. 결정과 증거 보관 규칙은 [ST Edge AI backend 문서](docs/backends/stedgeai.md)에 기록합니다.
+## 해결하려는 문제
 
-### Sprint 0에서 확보한 재현 근거
+서버나 GPU에서 정상 실행되는 ONNX 모델도 임베디드 NPU에서는 지원 연산자, 데이터 형식, shape, layout, 메모리 맵과 firmware 구성의 차이로 그대로 배포되지 않을 수 있습니다. 컴파일이 성공해도 일부 연산이 CPU로 fallback되거나 link, signing, programming, initialization 및 inference 단계에서 실패할 수 있습니다.
 
-ConMamba 기반 ONNX 모델의 Neural-ART 배포 사례에서 다음을 확인했습니다.
+ARONA는 문서상의 연산자 지원표만 확인하지 않고 실제 제조사 컴파일러의 실행 계획과 보드 자원을 함께 분석합니다. 이를 통해 “컴파일러가 모델을 처리했는가”와 “생성된 firmware가 실제 보드에서 반복 추론되는가”를 구분하고, 실패 지점과 판단 근거를 재현 가능한 실행 기록으로 남깁니다.
 
-- 모델 compile에 성공해도 전체 2,072개 실행 epoch 중 1,530개가 Cortex-M55 software fallback으로 배치될 수 있음
-- 최초 탑재 실패 원인이 미지원 연산이 아니라 잘못된 board memory profile, linker 배치 및 외부 Flash 설정일 수 있음
-- 존재하지 않는 HyperRAM을 제거한 뒤에는 application code와 activation의 SRAM 경쟁이 직접적인 제약이 됨
-- 원본 모델을 바꾸지 않고 code·constant를 외부 Flash XIP로 옮겨 activation용 내부 SRAM을 확보하면 target validation에 성공할 수 있음
+## 핵심 기능
 
-따라서 ARONA는 `compile succeeded`와 `deployable on the actual board`를 별도 상태로 관리하고,
-operator placement와 hardware resource feasibility를 함께 분석합니다.
+### 환경과 보드 도구 점검
 
-## Sprint 1~4 계획
+`arona doctor`와 `arona discover`는 ST Edge AI Core, STM32CubeProgrammer CLI, NUCLEO external loader, Make, Arm GCC, objcopy, STM32 Signing Tool 및 ST-LINK 가상 COM 포트를 확인합니다. COM 포트 번호는 연결 환경마다 달라질 수 있으므로 자동 탐지 결과를 확인하거나 `--serial-port COMx`로 직접 지정합니다.
 
-| 스프린트 | 기간 | 핵심 목표 | 종료 조건 |
-| --- | --- | --- | --- |
-| Sprint 1 | 8/1~8/7 | Neural-ART baseline·ONNX frontend·resource/deployment 계약 고정 | 실제 toolchain과 ConMamba 재현 fixture를 기준으로 장치 탐지, ONNX 분석 및 단계·메모리 schema가 테스트를 통과함 |
-| Sprint 2 | 8/8~8/14 | `stedgeai` adapter와 fallback·partition·memory·실패 단계 분석 | baseline compile 결과에서 software epoch와 memory pool을 추출하고 실제 NUCLEO memory map 불일치 및 실패 단계를 진단함 |
-| Sprint 3 | 8/15~8/21 | exact rewrite 2종과 compiler-in-the-loop 검증·원복 | rewrite 후보를 ONNX Runtime으로 검증하고 재컴파일·target 측정 후 개선된 후보만 채택함 |
-| Sprint 4 | 8/22~8/27 | terminal UX·통합 보고서·실기기 회귀 검증·릴리스 | 깨끗한 환경에서 CLI 데모를 재현하고 8/27 18:00 전에 release와 제출물을 확정함 |
+### 실제 컴파일러 기반 하드웨어 적합성 분석
 
-세부 작업, 담당 분배, 주간 gate와 완료 조건은 [Sprint 계획](docs/SPRINT_PLAN.md)에 정리합니다.
+`stedgeai analyze` 결과에서 컴파일러 epoch, 순수 하드웨어·hybrid·순수 소프트웨어 배치, fallback 연산자, graph partition, NPU·CPU 전환 및 메모리 풀을 구조화합니다. 컴파일러가 선택한 주소와 크기는 NUCLEO-N657X0-Q의 실제 메모리 맵과 대조합니다.
 
-## 개발 시작
+컴파일러 epoch은 ST Edge AI Core가 모델을 분할한 실행 단위이며 학습 epoch과는 다른 개념입니다.
 
-Python과 오픈소스 패키지는 `uv`와 `uv.lock`으로 관리합니다.
+### 안전한 rewrite 승인과 자동 원복
 
-```bash
-uv sync
-uv run arona --help
-uv run pytest
+현재 구현된 rewrite는 모델 끝의 표준 ONNX ArgMax를 host 후처리로 외부화하는 terminal ArgMax 변환입니다. 후보가 만들어지면 ONNX Runtime 출력 동등성과 기준·후보 컴파일러 결과를 모두 확인하며, 조건을 만족하지 않으면 원본 모델로 자동 원복합니다.
+
+두 MVP 테스트 모델의 원본 그래프에는 terminal ArgMax 적용 조건이 없어 실기기 E2E에서는 rewrite가 채택되지 않았습니다. 현재 실증 범위는 경량화 성과가 아니라 컴파일러 기반 적합성 분석, 불필요한 변환을 거부하는 안전한 선택과 자동 배포입니다.
+
+### STM32N6 배포 자동화
+
+`arona optimize --deploy`는 공식 STM32N6 application의 runtime 확인, UART telemetry 계측, application 설정, fixed-input 적용, model code generation, firmware build와 signing, ST-LINK programming 및 UART validation을 순서대로 실행합니다. Programming 이후에는 JP2를 Flash boot로 전환할 때까지 CLI가 멈추고 사용자의 확인을 기다립니다.
+
+### 재현 가능한 결과 보고
+
+실행 명령, 도구 버전, 모델 체크섬, 컴파일러 로그, 배치 결과, 메모리 적합성, rewrite 이력, firmware 체크섬, programming 결과와 UART 측정값을 versioned JSON Schema 및 Markdown으로 저장합니다.
+
+## 시스템 구성
+
+```mermaid
+flowchart TD
+    A["외부 ONNX 모델 입력"] --> B["doctor / discover"]
+    B --> C["ST Edge AI Core 기준 분석"]
+    C --> D["NPU·CPU 배치 및 메모리 적합성 진단"]
+    D --> E["rewrite 후보 생성"]
+    E --> F["ONNX Runtime 출력 동등성 검증"]
+    F --> G["기준·후보 컴파일러 결과 비교"]
+    G --> H{"안전하고 실제 이득이 있는가?"}
+    H -- "예" --> I["후보 모델 선택"]
+    H -- "아니요 또는 적용 불가" --> J["원본 모델 유지"]
+    I --> K["generate → build/sign"]
+    J --> K
+    K --> L["Development boot에서 program"]
+    L --> M["Flash boot로 전환"]
+    M --> N["UART 실기기 검증"]
+    N --> O["JSON·Markdown 보고서"]
 ```
 
-ARONA의 모든 명령은 같은 터미널 UX 규칙을 사용합니다. 파랑·핑크 전경색의 명령 헤더,
-정렬된 키/값, 번호가 붙은 진행 단계, `✓`/`!`/`✗` 상태, 결과·경고 상자로 긴 컴파일 및
-보드 배포 과정을 구분합니다. Windows Terminal에서 색과 유니코드를 강제로 활성화하려면:
+제조사 종속 로직은 공통 `BackendAdapter` 뒤에 분리하고, ONNX frontend, 최적화 검증, CLI 및 결과 보고 계층은 다른 backend에서도 재사용할 수 있도록 구성했습니다.
+
+## NUCLEO-N657X0-Q 실측 결과
+
+2026년 8월 25일 Windows x64 터미널에서 두 외부 테스트 모델을 처음부터 다시 배포하는 one-shot E2E 검증을 수행했습니다.
+
+| 외부 테스트 모델 | 컴파일러 배치 | UART 반복 검증 | 순수 모델 추론 시간 |
+| --- | --- | --- | --- |
+| MobileNetV2 0.35 Food-101 128×128 QDQ | 순수 HW 54, hybrid 0, 순수 SW 1 / 총 55 epoch | 1,023/1,023 성공 | 2~3 ms, 평균 2.641 ms |
+| YOLO26n COCO-Person 256×256 QDQ Int8 | 순수 HW 146, hybrid 16, 순수 SW 14 / 총 176 epoch | 465/465 성공 | 20~21 ms, 평균 20.944 ms |
+
+YOLO26n의 순수 소프트웨어 epoch 14개는 Conv 8개, DequantizeLinear 1개, QuantizeLinear 2개, Softmax 2개, float Sub 1개이며 하나의 CPU partition과 한 번의 NPU·CPU 전환을 형성했습니다. 하드웨어가 관여하는 순수 HW와 hybrid epoch을 합치면 162/176, 약 92.0%이지만 이를 순수 NPU 배치율로 해석하지 않습니다.
+
+위 결과는 fixed-input에서 생성된 firmware가 중단 없이 반복 추론되고 참고 latency 수준과 일관됨을 검증한 것입니다. 카메라 촬영, 전·후처리를 포함한 application 전체 처리량이나 Food-101·COCO-Person 정확도를 측정한 결과는 아닙니다. 자세한 제출 기준 설명은 [`1차 제출 결과보고서.md`](./1차%20제출%20결과보고서.md)를 참고하십시오.
+
+## Windows x64 설치 및 실행 가이드
+
+아래 절차는 Windows PowerShell과 NUCLEO-N657X0-Q를 기준으로, 새 개발 환경에서 MobileNetV2 fixed-input E2E를 실행하는 순서입니다. 명령은 저장소 루트에서 실행합니다.
+
+### 0. 준비물과 외부 도구
+
+필요한 하드웨어와 제조사 도구는 다음과 같습니다.
+
+- NUCLEO-N657X0-Q와 데이터 통신이 가능한 USB 케이블
+- ST Edge AI Core 4.0.1
+- STM32CubeProgrammer 2.22.0과 NUCLEO-N657X0-Q external loader
+- GNU Make, STM32 GNU Arm toolchain, `arm-none-eabi-objcopy`, STM32 Signing Tool
+- Git과 `uv`
+
+ARONA는 STM32CubeProgrammer와 build tool의 CLI를 직접 호출하므로 STM32CubeProgrammer 또는 STM32CubeIDE GUI에서 프로젝트를 열어 실행할 필요는 없습니다. 현재 자동 탐지는 일반 설치 경로의 STM32CubeProgrammer와 `C:\ST\STM32CubeIDE_2.2.0`, `2.0.0`, `1.19.0`에 포함된 CLI build tool을 확인하며, 별도 설치한 도구는 실행 파일이 있는 디렉터리를 `PATH`에 추가해야 합니다.
+
+> [!TIP]
+> Windows의 긴 경로 문제를 줄이려면 저장소를 `C:\work\ARONA`처럼 짧은 경로에 clone하는 것을 권장합니다.
+
+### 1. Git과 uv 설치
+
+관리자 권한이 가능한 PowerShell에서 Git과 uv를 설치하고 새 터미널을 엽니다.
+
+```powershell
+winget install --id Git.Git -e
+winget install --id astral-sh.uv -e
+
+git --version
+uv --version
+```
+
+### 2. 저장소 clone
+
+```powershell
+New-Item -ItemType Directory -Path C:\work -Force | Out-Null
+Set-Location C:\work
+
+git -c core.longpaths=true clone `
+  https://github.com/eodudrepublic/Accelerator-aware-Rewriting-and-Operator-compatible-Neural-Adaptation.git `
+  ARONA
+
+Set-Location .\ARONA
+```
+
+이미 clone한 저장소에서 vendor dependency의 긴 경로 오류가 발생하면 다음 설정도 사용할 수 있습니다.
+
+```powershell
+git config --global core.longpaths true
+```
+
+### 3. Python 환경과 ARONA 설치
+
+`uv`가 `.python-version`에 맞는 Python 3.11과 잠금된 dependency를 준비합니다.
+
+```powershell
+uv sync --frozen
+uv run arona --help
+```
+
+직접 `arona` 명령을 사용하려면 현재 PowerShell에서 가상환경을 활성화합니다.
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\.venv\Scripts\Activate.ps1
+
+arona --help
+```
+
+가상환경을 활성화하지 않는 경우 이후 명령의 `arona`를 `uv run arona`로 바꾸면 됩니다.
+
+### 4. ST Edge AI Core 4.0.1 연결
+
+ST Edge AI Core가 `C:\ST\STEdgeAI\4.0`에 설치된 경우 다음 스크립트가 실행 파일과 필요한 Python module을 확인하고 현재 터미널의 `ARONA_STEDGEAI_PATH`, `STEDGEAI_CORE_DIR`, `PATH`를 설정합니다.
+
+```powershell
+. .\scripts\use_stedgeai.ps1 -Version 4.0
+stedgeai --version
+```
+
+정상 설치에서는 `ST Edge AI Core v4.0.1`이 출력되어야 합니다. 환경변수를 사용자 계정에 저장하려면 `-Persist`를 추가한 뒤 새 터미널을 여십시오.
+
+```powershell
+. .\scripts\use_stedgeai.ps1 -Version 4.0 -Persist
+```
+
+### 5. STM32 도구와 보드 연결 점검
+
+보드를 USB로 연결하고 Windows가 생성한 ST-LINK 가상 COM 포트를 확인합니다. COM 번호는 PC와 연결 순서에 따라 달라지므로 예시의 `COM5`를 그대로 사용하지 마십시오.
+
+```powershell
+Get-CimInstance Win32_SerialPort |
+  Select-Object DeviceID, Name, PNPDeviceID
+```
+
+확인한 포트로 ARONA 환경 점검을 실행합니다.
+
+```powershell
+$port = "COM5"  # 실제 확인한 COM 번호로 변경
+
+arona discover
+arona doctor --serial-port $port
+```
+
+`doctor`에서 다음 항목이 준비된 것으로 표시되어야 배포할 수 있습니다.
+
+- ST Edge AI Core
+- STM32CubeProgrammer
+- NUCLEO external loader
+- Make
+- Arm GCC와 objcopy
+- STM32 Signing Tool
+- ST-LINK serial port
+
+STM32CubeProgrammer CLI로 SWD 연결을 직접 확인하려면 JP2를 Development boot로 설정하고 보드 전원을 다시 연결한 뒤 다음 명령을 사용합니다.
+
+```powershell
+& "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe" `
+  -c port=SWD mode=UR
+```
+
+### 6. 외부 MVP 테스트 모델 다운로드
+
+다음 스크립트는 MobileNetV2와 YOLO26n을 `models\downloads`에 내려받고 `models/manifest.json`의 SHA-256과 비교합니다. 이 디렉터리는 Git에서 제외됩니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\download_mvp_models.ps1
+```
+
+다운로드 결과를 확인합니다.
+
+```powershell
+Get-ChildItem .\models\downloads\*.onnx
+```
+
+### 7. 원본 ONNX의 ST Edge AI 분석 확인
+
+다음 명령은 MobileNetV2 ONNX를 STM32N6 Neural-ART 대상으로 분석하고 원문 로그를 저장합니다. 이 단계는 target ONNX를 새로 생성하는 작업이 아니라 컴파일러의 배치 및 메모리 분석을 독립적으로 확인하는 선택 절차입니다.
+
+```powershell
+New-Item -ItemType Directory -Path .\outputs\compiler -Force | Out-Null
+
+stedgeai analyze --target stm32n6 `
+  --model "models\downloads\mobilenetv2_a035_128_food101_qdq.onnx" `
+  --type onnx `
+  --st-neural-art *> "outputs\compiler\mobilenetv2.log"
+```
+
+ARONA를 통해 같은 모델의 구조화된 분석 보고서를 생성하려면 다음을 실행합니다.
+
+```powershell
+arona optimize .\models\downloads\mobilenetv2_a035_128_food101_qdq.onnx `
+  --target stedgeai `
+  --output-directory .\outputs\analysis
+```
+
+### 8. STM32N6 image classification application 준비
+
+공식 ST application은 저장소에 포함하지 않고 `outputs\vendor` 아래에 clone합니다.
+
+```powershell
+New-Item -ItemType Directory -Path .\outputs\vendor -Force | Out-Null
+
+git -c core.longpaths=true clone --recursive `
+  https://github.com/STMicroelectronics/STM32N6-GettingStarted-ImageClassification.git `
+  outputs\vendor\STM32N6-GettingStarted-ImageClassification
+```
+
+필수 경로를 확인합니다.
+
+```powershell
+$vendor = "outputs\vendor\STM32N6-GettingStarted-ImageClassification"
+$app = "$vendor\Application\NUCLEO-N657X0-Q"
+
+Test-Path $app
+Test-Path "$vendor\Model"
+Test-Path "$vendor\FSBL\ai_fsbl.hex"
+```
+
+다음 세 명령은 UART telemetry, MobileNetV2 application 설정과 카메라 없는 fixed-input 추론을 각각 적용합니다. 모두 같은 변경을 중복 적용하지 않도록 구현되어 있습니다.
+
+```powershell
+arona deployment instrument `
+  --application image_classification `
+  $app
+
+arona deployment configure `
+  --application image_classification `
+  $app
+
+arona deployment fixed-input `
+  --application image_classification `
+  $app
+```
+
+`arona optimize --deploy --fixed-input`도 위 준비 단계를 자동으로 수행하므로, 이 수동 명령은 각 단계를 따로 확인하거나 문제를 진단할 때 사용하면 됩니다.
+
+### 9. 터미널 UI와 대화형 실행
+
+Windows Terminal에서 유니코드와 색상을 명시적으로 활성화할 수 있습니다.
 
 ```powershell
 $env:ARONA_UNICODE = "1"
 $env:ARONA_COLOR = "1"
-uv run arona doctor
 ```
 
-인자 없이 `arona`를 실행하면 화살표 키 기반 인터랙티브 런처가 열린다. 위·아래 키로
-작업을 고르고 Enter로 실행하며, 모델 경로 자동완성, 실행 계획 확인, 실행 후 다음 행동 선택을
-지원한다. 첫 화면은 모델·대상·환경과 전체 workflow를 요약한 작업 대시보드이고, 명령 실행
-중에는 `Inspect → Analyze → Optimize → Deploy → Validate` 트래커를 표시한다. 완료 후에는
-모델·출력 경로·소요 시간·종료 코드와 추천 다음 행동을 담은 결과 보고서로 전환된다. 기존 직접
-명령은 스크립트·CI·재현을 위해 그대로 유지된다.
+인자 없이 실행하면 화살표 키로 작업을 선택하는 대화형 런처가 열립니다.
 
 ```powershell
-uv run arona
+arona
 ```
 
-런처를 명시적으로 열려면 `uv run arona interactive`를 사용할 수 있다. 입력이나 출력이 TTY가
-아닌 환경에서 인자 없이 실행하면 런처 대신 일반 도움말을 출력한다.
+자동화나 재현 기록이 필요하면 아래의 직접 CLI 방식을 사용하십시오.
 
-backend, pipeline과 CLI/reporting이 공유하는 Pydantic 계약은 `src/arona/contracts/v1.py`, 생성된 JSON Schema는
-`schemas/v0.1.0/`에 있습니다.
+### 10. MobileNetV2 one-shot 최적화 및 실기기 배포
 
-```bash
-uv run arona schema export
-```
+Programming 전에 보드 전원을 분리하고 다음과 같이 설정한 뒤 USB 전원을 다시 연결합니다.
 
-현재 MVP 파이프라인은 terminal ArgMax를 안전 조건 아래 외부화하고, ONNX Runtime 동등성과
-baseline/candidate compiler 결과를 모두 통과한 후보만 채택합니다. 캡처 log를 생략하면
-로컬 `stedgeai`를 직접 호출하며, 재현 테스트에서는 원본·후보 log를 각각 지정할 수 있습니다.
-checkpoint 4 CLI는 `--target stedgeai`, `--validation-input`, `--deploy`,
-`--deployment-result` 옵션을 고정했습니다. `--deploy`는 기본적으로 STM32N6
-`runtime 확인/동기화 -> telemetry 계측 -> application 설정 -> 입력 모드 적용 -> generate ->
-build -> program -> validate` sequence를 실행합니다. 준비 작업은 멱등 방식으로 적용되며,
-`--fixed-input`과 `--camera-input`으로 카메라 없는 검증과 실제 카메라 입력을 전환할 수 있습니다.
-이미 검증된
-`deployment-result.json`이 있을 때는 `--deployment-result`로 해당 evidence를 최적화 run
-report에 결합할 수 있습니다.
+- JP1: position 1, `[1-2]`
+- JP2: position 2, `[2-3]`, Development boot
 
-```bash
-uv run arona discover
-uv run arona analyze model.onnx --compiler-log tests/fixtures/backends/stedgeai/conmamba_fallback/compiler.log
-uv run arona optimize model-with-terminal-argmax.onnx
-uv run arona optimize model-with-terminal-argmax.onnx \
-  --target stedgeai \
-  --compiler-log tests/fixtures/backends/stedgeai/conmamba_fallback/compiler.log \
-  --candidate-compiler-log tests/fixtures/backends/stedgeai/conmamba_xip_101/compiler.log
-uv run arona optimize model-with-terminal-argmax.onnx \
-  --target stedgeai \
-  --validation-input inputs/demo \
-  --deploy \
-  --core-directory C:/ST/STEdgeAI2/4.0 \
-  --fixed-input \
-  --application-directory outputs/vendor/STM32N6-GettingStarted-ImageClassification/Application/NUCLEO-N657X0-Q \
-  --model-support-directory outputs/vendor/STM32N6-GettingStarted-ImageClassification/Model \
-  --fsbl outputs/vendor/STM32N6-GettingStarted-ImageClassification/FSBL/ai_fsbl.hex \
-  --compiler-log tests/fixtures/backends/stedgeai/conmamba_fallback/compiler.log \
-  --candidate-compiler-log tests/fixtures/backends/stedgeai/conmamba_xip_101/compiler.log
-```
-
-Windows PowerShell에서 ST Edge AI Core를 현재 터미널 세션에 불러오려면 다음을 먼저 실행합니다.
+다음 명령은 컴파일러 분석부터 application 준비, generate, build/sign, program 및 UART validation까지 실행합니다.
 
 ```powershell
-. .\scripts\use_stedgeai.ps1
-stedgeai --version
+$port = "COM5"  # 실제 연결된 ST-LINK 가상 COM 포트
+$vendor = "outputs\vendor\STM32N6-GettingStarted-ImageClassification"
+$app = "$vendor\Application\NUCLEO-N657X0-Q"
+$model = "models\downloads\mobilenetv2_a035_128_food101_qdq.onnx"
+
+arona optimize $model `
+  --target stedgeai `
+  --deploy `
+  --deployment-application image_classification `
+  --application-directory $app `
+  --model-support-directory "$vendor\Model" `
+  --fsbl "$vendor\FSBL\ai_fsbl.hex" `
+  --serial-port $port `
+  --fixed-input `
+  --inference-count 5 `
+  --capture-seconds 30 `
+  --build-top build-arona-mobilenetv2 `
+  --output-directory outputs\runs
 ```
 
-깨진 설치 후보는 건너뛰며, `ARONA_STEDGEAI_PATH`, `STEDGEAI_CORE_DIR`, `PATH`를 현재 세션에
-설정합니다. 매번 입력하지 않으려면 `-Persist`를 붙여 사용자 환경변수에 저장할 수 있습니다.
+Programming이 완료되면 CLI가 멈추고 Flash boot 전환을 안내합니다.
 
-결과 디렉터리에는 원본·후보 분석, `optimized-model.onnx`, `postprocess.json`, 10개 입력
-동등성 결과, rewrite 이력, 최종 선택을 담은 JSON과 Markdown 보고서가 생성됩니다. deployment
-sequence가 실행되면 `deployment/deployment-result.json`, `deployment-analysis.json`과 board
-실행 상태가 `report.md`에 추가됩니다.
+1. 보드 USB 전원을 분리합니다.
+2. JP2를 position 1, `[1-2]`인 Flash boot로 옮깁니다. JP1은 position 1을 유지합니다.
+3. USB 전원을 다시 연결하고 같은 COM 포트가 복구될 때까지 기다립니다.
+4. CLI의 `Continue with UART inference validation?` 질문에 확인 입력을 합니다.
 
-checkpoint 4 재검증에서는 ST Edge AI Core 4.0.1로 두 모델을 새로 generate/build/program한 뒤
-NUCLEO-N657X0-Q fixed-input smoke에서 MobileNetV2 image classification 343회(평균 2.647 ms),
-YOLO26n object detection 150회(평균 20.953 ms)의 연속 inference를 확인했습니다. 모델과 raw
-실행 산출물은 Git에 포함하지 않으며, checksum과 환경·결과는
-[checkpoint 4 E2E evidence](docs/checkpoint4-e2e-evidence.md), 재현 절차는
-[MVP demo 문서](docs/demo.md)를 참고합니다.
+ARONA는 UART에서 모델 이름, fixed-input hash와 연속 추론 결과를 확인한 뒤 최종 JSON 및 Markdown 보고서를 생성합니다.
 
-환경 구성, 품질 검사 및 의존성 갱신 방법은 [개발 문서](docs/development.md), 계약의 의미와
-호환성 정책은 [실행 결과 JSON 계약](docs/contracts/backend-cli.md), 직접 의존성의 역할과
-현재 잠금 버전은 [의존성 목록](docs/dependencies.md)을 참고합니다.
+### 11. YOLO26n object detection 배포
+
+YOLO26n을 검증하려면 공식 object detection application을 추가로 준비합니다.
+
+```powershell
+git -c core.longpaths=true clone --recursive `
+  https://github.com/STMicroelectronics/STM32N6-GettingStarted-ObjectDetection.git `
+  outputs\vendor\STM32N6-GettingStarted-ObjectDetection
+```
+
+보드를 Development boot로 설정하고 다음 명령을 실행합니다. Programming 이후의 Flash boot 전환은 MobileNetV2와 같습니다.
+
+```powershell
+$port = "COM5"  # 실제 연결된 ST-LINK 가상 COM 포트
+$vendor = "outputs\vendor\STM32N6-GettingStarted-ObjectDetection"
+$app = "$vendor\Application\NUCLEO-N657X0-Q"
+$model = "models\downloads\yolo26n_256_coco_person_qdq_int8.onnx"
+
+arona optimize $model `
+  --target stedgeai `
+  --deploy `
+  --deployment-application object_detection `
+  --application-directory $app `
+  --model-support-directory "$vendor\Model" `
+  --fsbl "$vendor\FSBL\ai_fsbl.hex" `
+  --serial-port $port `
+  --fixed-input `
+  --inference-count 5 `
+  --capture-seconds 30 `
+  --build-top build-arona-yolo26n `
+  --output-directory outputs\runs
+```
+
+## 주요 CLI 명령
+
+```powershell
+# 대화형 런처
+arona
+
+# 로컬 환경 점검
+arona doctor --serial-port COM5
+arona discover
+
+# ONNX 및 실제 컴파일러 결과 분석
+arona analyze model.onnx --compiler-log outputs\compiler\model.log
+
+# live compiler를 이용한 최적화 판단
+arona optimize model.onnx --target stedgeai
+
+# 전체 배포 흐름
+arona optimize model.onnx --target stedgeai --deploy `
+  --application-directory <application-path> `
+  --model-support-directory <model-support-path> `
+  --fsbl <fsbl-path> `
+  --serial-port COMx `
+  --fixed-input
+
+# 공개 JSON Schema 재생성
+arona schema export
+```
+
+전체 옵션은 각 명령의 `--help`에서 확인할 수 있습니다.
+
+```powershell
+arona optimize --help
+arona deployment --help
+```
+
+## 실행 산출물
+
+각 optimize 실행은 `--output-directory` 아래에 시간 기반 run 디렉터리를 생성합니다.
+
+```text
+outputs/runs/<run-id>/
+├── original-analysis.json
+├── optimized-analysis.json       # 후보 분석이 수행된 경우
+├── optimized-model.onnx          # rewrite 후보가 생성된 경우
+├── rewrite-history.json          # rewrite 판단이 존재하는 경우
+├── postprocess.json              # host 후처리 계약이 존재하는 경우
+├── run-report.json
+├── deployment-analysis.json      # --deploy 실행 시
+├── compiler/
+├── deployment/
+│   ├── prepare/
+│   ├── generate/
+│   ├── build/
+│   ├── program/
+│   ├── validate/
+│   └── deployment-result.json
+└── report.md
+```
+
+모델과 vendor build output은 Git에 포함하지 않으며, 결과 공유 시에도 각 파일의 라이선스를 먼저 확인해야 합니다.
+
+## 품질 검사
+
+```powershell
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy src
+uv run pytest --cov=arona --cov-report=term
+```
+
+2026년 8월 25일 현재 자동 검증 결과는 `70 passed, 1 skipped`, 분기 측정을 포함한 전체 코드 커버리지 81%입니다. 제외된 1개 테스트는 실물 보드를 요구하는 hardware test입니다.
+
+## 현재 한계와 향후 방향
+
+- 현재 정식 target은 NUCLEO-N657X0-Q, backend는 `stedgeai`로 제한됩니다.
+- MobileNetV2와 YOLO26n은 제품 내장 모델이 아니라 MVP E2E 검증용 외부 입력입니다.
+- 구현된 graph rewrite는 terminal ArgMax 한 종류이며, 두 MVP 원본 모델에서는 적용 조건이 성립하지 않았습니다.
+- JP2 Development/Flash boot 전환과 USB 재연결은 사용자가 물리적으로 수행해야 합니다.
+- ST Edge AI Core와 STM32 programmer/build toolchain은 사용자가 별도로 설치해야 합니다.
+
+최종 제출까지 model manifest와 application 설정을 일반화하고 더 다양한 분류·검출 모델, board profile과 제조사 backend를 연결할 계획입니다. 장기적으로는 정확도 손실, latency, RAM, Flash 및 전력 조건을 입력받아 양자화, pruning, channel 축소와 연산 블록 치환 후보를 생성하고, 실제 컴파일러와 보드 측정으로 가장 적합한 모델을 자동 선택하는 하드웨어 인지형 경량화 기능을 목표로 합니다.
+
+## 문서
+
+- [MVP 시연 절차](docs/demo.md)
+- [Windows E2E 설치·검증 기록](docs/windows-e2e-setup-validation.md)
+- [NUCLEO-N657X0-Q 연결 및 복구 매뉴얼](docs/nucleo-n657x0-q-agent-manual.md)
+- [ST Edge AI backend](docs/backends/stedgeai.md)
+- [실행 결과 JSON 계약](docs/contracts/backend-cli.md)
+- [개발 환경 및 품질 검사](docs/development.md)
+- [의존성 및 라이선스](docs/dependencies.md)
 
 ## 라이선스
 
-이 프로젝트는 [MIT License](LICENSE)를 따릅니다.
+ARONA 소스코드는 [MIT License](LICENSE)를 따릅니다. 외부 테스트 모델과 ST 도구·application에는 각각의 별도 라이선스가 적용되며 ARONA의 MIT 라이선스에 포함되지 않습니다.
