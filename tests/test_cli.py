@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import onnx
 from onnx import TensorProto, helper
@@ -258,6 +259,16 @@ def test_optimize_deploy_runs_live_stm32n6_sequence(monkeypatch, tmp_path: Path)
             )
 
     monkeypatch.setattr(cli, "Stm32N6Deployer", FakeDeployer)
+    monkeypatch.setattr(
+        cli,
+        "prepare_deployment_application",
+        lambda application, application_directory, core_directory, output_directory, fixed_input: (
+            calls.append(
+                f"prepare:{core_directory.name}:{fixed_input}:{application_directory.name}"
+            )
+            or SimpleNamespace(runtime_version="v4.0.1", input_mode="fixed")
+        ),
+    )
 
     result = runner.invoke(
         app,
@@ -269,14 +280,15 @@ def test_optimize_deploy_runs_live_stm32n6_sequence(monkeypatch, tmp_path: Path)
             "--validation-input",
             str(validation_input),
             "--deploy",
+            "--core-directory",
+            str(tmp_path / "core-4.0"),
+            "--fixed-input",
             "--application-directory",
             str(application_directory),
             "--model-support-directory",
             str(model_support_directory),
             "--fsbl",
             str(fsbl),
-            "--expected-input-fnv1a",
-            "0xfbe51dc5",
             "--compiler-log",
             str(baseline_log),
             "--candidate-compiler-log",
@@ -290,6 +302,7 @@ def test_optimize_deploy_runs_live_stm32n6_sequence(monkeypatch, tmp_path: Path)
     assert result.exit_code == 0
     assert "Move JP2 to position 1" in result.stdout
     assert calls == [
+        "prepare:core-4.0:True:NUCLEO-N657X0-Q",
         "generate:optimized-model.onnx:Model",
         "build:NUCLEO-N657X0-Q:model-files:8:UVCL",
         "program:3:optimized-model.onnx",

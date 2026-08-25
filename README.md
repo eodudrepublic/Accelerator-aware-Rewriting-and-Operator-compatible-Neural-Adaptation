@@ -251,7 +251,10 @@ baseline/candidate compiler 결과를 모두 통과한 후보만 채택합니다
 로컬 `stedgeai`를 직접 호출하며, 재현 테스트에서는 원본·후보 log를 각각 지정할 수 있습니다.
 checkpoint 4 CLI는 `--target stedgeai`, `--validation-input`, `--deploy`,
 `--deployment-result` 옵션을 고정했습니다. `--deploy`는 기본적으로 STM32N6
-`generate -> build -> program -> validate` sequence를 실행하고, 이미 검증된
+`runtime 확인/동기화 -> telemetry 계측 -> application 설정 -> 입력 모드 적용 -> generate ->
+build -> program -> validate` sequence를 실행합니다. 준비 작업은 멱등 방식으로 적용되며,
+`--fixed-input`과 `--camera-input`으로 카메라 없는 검증과 실제 카메라 입력을 전환할 수 있습니다.
+이미 검증된
 `deployment-result.json`이 있을 때는 `--deployment-result`로 해당 evidence를 최적화 run
 report에 결합할 수 있습니다.
 
@@ -267,6 +270,8 @@ uv run arona optimize model-with-terminal-argmax.onnx \
   --target stedgeai \
   --validation-input inputs/demo \
   --deploy \
+  --core-directory C:/ST/STEdgeAI2/4.0 \
+  --fixed-input \
   --application-directory outputs/vendor/STM32N6-GettingStarted-ImageClassification/Application/NUCLEO-N657X0-Q \
   --model-support-directory outputs/vendor/STM32N6-GettingStarted-ImageClassification/Model \
   --fsbl outputs/vendor/STM32N6-GettingStarted-ImageClassification/FSBL/ai_fsbl.hex \

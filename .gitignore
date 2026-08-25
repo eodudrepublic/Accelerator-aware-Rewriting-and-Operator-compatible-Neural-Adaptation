@@ -21,6 +21,10 @@ models/downloads/
 models/*.onnx
 inputs/
 
+# Raw STM32Cube.AI/ST Edge AI compiler workspaces generated in the project root.
+st_ai_output/
+st_ai_ws/
+
 # Local study notes and scratch files.
 ARONA_PROJECT_GUIDE.md
 study/

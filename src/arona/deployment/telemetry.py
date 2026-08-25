@@ -217,6 +217,109 @@ def instrument_fixed_input_smoke(
     return source_path, True
 
 
+def configure_fixed_input_smoke(
+    application: DeploymentApplication,
+    application_directory: Path,
+    *,
+    enabled: bool,
+) -> tuple[Path, bool]:
+    """Apply the requested camera/fixed-input mode without duplicating instrumentation."""
+
+    if enabled:
+        return instrument_fixed_input_smoke(application, application_directory)
+
+    source_path, telemetry_changed = instrument_uart_telemetry(
+        application,
+        application_directory,
+    )
+    source = source_path.read_text(encoding="utf-8")
+    if FIXED_INPUT_MARKER not in source:
+        return source_path, telemetry_changed
+
+    source = _restore_camera_input(application, source)
+    source_path.write_text(source, encoding="utf-8")
+    return source_path, True
+
+
+def _restore_camera_input(application: DeploymentApplication, source: str) -> str:
+    source = _replace_once(
+        source,
+        "static uint32_t arona_inference_sequence;\n" + _FIXED_INPUT_SUPPORT,
+        "static uint32_t arona_inference_sequence;\n",
+        "fixed-input support",
+    )
+    source = _replace_once(
+        source,
+        "#if !ARONA_FIXED_INPUT_SMOKE\n"
+        + _CAMERA_INITIALIZATION
+        + "#else\n"
+        + "  arona_fixed_input_fnv1a = ARONA_FixedInput_Init(nn_in, nn_in_len);\n"
+        + "#endif\n",
+        _CAMERA_INITIALIZATION,
+        "fixed-input camera initialization",
+    )
+    source = _replace_once(
+        source,
+        "#if !ARONA_FIXED_INPUT_SMOKE\n"
+        + _CAMERA_LOOP_INPUT
+        + "#else\n"
+        + "    uint32_t ts[2] = { 0 };\n"
+        + "#endif\n",
+        _CAMERA_LOOP_INPUT,
+        "fixed-input camera loop",
+    )
+
+    if application == DeploymentApplication.IMAGE_CLASSIFICATION:
+        display_call = "    Display_NetworkOutput(ts[1] - ts[0]);\n"
+        fixed_telemetry = (
+            '    printf("ARONA_INFERENCE seq=%lu latency_ms=%lu class=%s '
+            'model=%s input=fixed fnv1a=0x%08lx\\n",\n'
+            "           (unsigned long) ++arona_inference_sequence,\n"
+            "           (unsigned long) (ts[1] - ts[0]),\n"
+            "           nn_top1_output_class_name,\n"
+            "           STAI_NETWORK_ORIGIN_MODEL_NAME,\n"
+            "           (unsigned long) arona_fixed_input_fnv1a);\n"
+        )
+        camera_telemetry = (
+            '    printf("ARONA_INFERENCE seq=%lu latency_ms=%lu class=%s\\n",\n'
+            "           (unsigned long) ++arona_inference_sequence,\n"
+            "           (unsigned long) (ts[1] - ts[0]),\n"
+            "           nn_top1_output_class_name);\n"
+        )
+    elif application == DeploymentApplication.OBJECT_DETECTION:
+        display_call = "    Display_NetworkOutput(&pp_output, ts[1] - ts[0]);\n"
+        fixed_telemetry = (
+            '    printf("ARONA_INFERENCE seq=%lu latency_ms=%lu detections=%lu '
+            'model=%s input=fixed fnv1a=0x%08lx\\n",\n'
+            "           (unsigned long) ++arona_inference_sequence,\n"
+            "           (unsigned long) (ts[1] - ts[0]),\n"
+            "           (unsigned long) pp_output.nb_detect,\n"
+            "           STAI_NETWORK_ORIGIN_MODEL_NAME,\n"
+            "           (unsigned long) arona_fixed_input_fnv1a);\n"
+        )
+        camera_telemetry = (
+            '    printf("ARONA_INFERENCE seq=%lu latency_ms=%lu detections=%lu\\n",\n'
+            "           (unsigned long) ++arona_inference_sequence,\n"
+            "           (unsigned long) (ts[1] - ts[0]),\n"
+            "           (unsigned long) pp_output.nb_detect);\n"
+        )
+    else:  # pragma: no cover - exhaustive with the current enum
+        raise TelemetryInstrumentationError(f"Unsupported application: {application}")
+
+    source = _replace_once(
+        source,
+        "#if !ARONA_FIXED_INPUT_SMOKE\n" + display_call + "#endif\n",
+        display_call,
+        "fixed-input display output",
+    )
+    return _replace_once(
+        source,
+        fixed_telemetry,
+        camera_telemetry,
+        "fixed-input UART telemetry",
+    )
+
+
 def _replace_once(source: str, anchor: str, replacement: str, label: str) -> str:
     occurrences = source.count(anchor)
     if occurrences != 1:

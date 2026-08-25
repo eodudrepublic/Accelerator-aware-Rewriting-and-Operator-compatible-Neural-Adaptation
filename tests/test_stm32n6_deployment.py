@@ -13,6 +13,7 @@ from arona.deployment.stm32n6 import (
     sync_stedgeai_runtime,
 )
 from arona.deployment.telemetry import (
+    configure_fixed_input_smoke,
     instrument_fixed_input_smoke,
     instrument_uart_telemetry,
 )
@@ -436,6 +437,37 @@ def test_fixed_input_smoke_is_idempotent_and_keeps_real_inference(tmp_path: Path
         assert "stai_network_run(network_context, STAI_MODE_SYNC)" in source
         assert "model=%s input=fixed fnv1a=0x%08lx" in source
         assert "#if !ARONA_FIXED_INPUT_SMOKE\n    CameraPipeline_IspUpdate();" in source
+
+
+def test_fixed_input_mode_can_return_to_camera_input(tmp_path: Path) -> None:
+    for application in (
+        DeploymentApplication.IMAGE_CLASSIFICATION,
+        DeploymentApplication.OBJECT_DETECTION,
+    ):
+        application_directory = tmp_path / application / "Application/NUCLEO-N657X0-Q"
+        source_path = application_directory / "Src/main.c"
+        source_path.parent.mkdir(parents=True)
+        original = _official_camera_source(application)
+        source_path.write_text(original, encoding="utf-8")
+
+        instrument_uart_telemetry(application, application_directory)
+        expected_camera_source = source_path.read_text(encoding="utf-8")
+        source_path.write_text(original, encoding="utf-8")
+
+        _, enabled_changed = configure_fixed_input_smoke(
+            application,
+            application_directory,
+            enabled=True,
+        )
+        _, disabled_changed = configure_fixed_input_smoke(
+            application,
+            application_directory,
+            enabled=False,
+        )
+
+        assert enabled_changed
+        assert disabled_changed
+        assert source_path.read_text(encoding="utf-8") == expected_camera_source
 
 
 def test_configure_fixed_mvp_applications(tmp_path: Path) -> None:

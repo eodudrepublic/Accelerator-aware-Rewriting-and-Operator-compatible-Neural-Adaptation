@@ -10,7 +10,14 @@ from typer import rich_utils
 
 from arona import __version__
 from arona.contracts.export import export_json_schemas
-from arona.contracts.v1 import DeploymentApplication, DeploymentResult, RunReport, StageStatus
+from arona.contracts.v1 import (
+    DeploymentApplication,
+    DeploymentResult,
+    DeploymentStage,
+    DeploymentStageName,
+    RunReport,
+    StageStatus,
+)
 from arona.deployment import (
     FirmwareImage,
     NucleoDeploymentConfig,
@@ -19,6 +26,7 @@ from arona.deployment import (
     configure_mvp_application,
     instrument_fixed_input_smoke,
     instrument_uart_telemetry,
+    prepare_deployment_application,
     sync_stedgeai_runtime,
 )
 from arona.deployment.stm32n6 import (
@@ -369,6 +377,23 @@ def optimize(
             help="Require deterministic fixed-input hash in UART telemetry.",
         ),
     ] = None,
+    core_directory: Annotated[
+        Path | None,
+        typer.Option(
+            "--core-directory",
+            help=(
+                "STEdgeAI Core root used to verify and synchronize the application runtime. "
+                "Defaults to STEDGEAI_CORE_DIR."
+            ),
+        ),
+    ] = None,
+    fixed_input: Annotated[
+        bool,
+        typer.Option(
+            "--fixed-input/--camera-input",
+            help="Use deterministic input instead of the application camera pipeline.",
+        ),
+    ] = False,
     build_top: Annotated[
         str,
         typer.Option("--build-top", help="Relative Make build directory name for --deploy."),
@@ -434,6 +459,8 @@ def optimize(
                     capture_seconds=capture_seconds,
                     expected_model_name=expected_model_name,
                     expected_input_fnv1a=expected_input_fnv1a,
+                    core_directory=core_directory,
+                    fixed_input=fixed_input,
                     build_top=build_top,
                     screen_interface=screen_interface,
                     jobs=jobs,
@@ -555,6 +582,8 @@ def _run_live_deployment(
     capture_seconds: float,
     expected_model_name: str | None,
     expected_input_fnv1a: str | None,
+    core_directory: Path | None,
+    fixed_input: bool,
     build_top: str,
     screen_interface: str,
     jobs: int,
@@ -567,18 +596,48 @@ def _run_live_deployment(
         timeout_seconds=600,
     )
     deployer = Stm32N6Deployer()
+    resolved_core_directory = _resolve_core_directory(core_directory)
 
     _echo_terminal(
         "\n"
         + "\n".join(
             render_command_header(
                 "Deploy",
-                "Generate, build, program, and validate the selected model on STM32N6.",
+                "Prepare, generate, build, program, and validate the selected model on STM32N6.",
             )
         )
     )
     _echo_terminal(
-        render_progress_step(1, 4, "Code generation", "running", "Generating model files")
+        render_progress_step(
+            1,
+            5,
+            "Application preparation",
+            "running",
+            "Checking runtime, telemetry, configuration, and input mode",
+        )
+    )
+    try:
+        preparation = prepare_deployment_application(
+            application,
+            application_directory,
+            resolved_core_directory,
+            deployment_directory / "prepare",
+            fixed_input=fixed_input,
+        )
+    except (ValueError, TelemetryInstrumentationError, OSError, KeyError) as error:
+        _echo_terminal(render_progress_step(1, 5, "Application preparation", "failed", str(error)))
+        return _deployment_preparation_failure(config, str(error))
+    _echo_terminal(
+        render_progress_step(
+            1,
+            5,
+            "Application preparation",
+            "succeeded",
+            f"Runtime {preparation.runtime_version} · {preparation.input_mode} input",
+        )
+    )
+    _echo_terminal(
+        render_progress_step(2, 5, "Code generation", "running", "Generating model files")
     )
     generate_result = deployer.generate(
         config,
@@ -587,13 +646,13 @@ def _run_live_deployment(
         deployment_directory / "generate",
     )
     results = [generate_result]
-    _echo_terminal(render_progress_step(1, 4, "Code generation", generate_result.status))
+    _echo_terminal(render_progress_step(2, 5, "Code generation", generate_result.status))
     if generate_result.status != StageStatus.SUCCEEDED:
         return _merge_deployment_results(results, config)
 
     generated_model_directory = deployment_directory / "generate/model-files"
     _echo_terminal(
-        render_progress_step(2, 4, "Build and link", "running", "Building signed application")
+        render_progress_step(3, 5, "Build and link", "running", "Building signed application")
     )
     build_result = deployer.build(
         config,
@@ -605,7 +664,7 @@ def _run_live_deployment(
         screen_interface=screen_interface,
     )
     results.append(build_result)
-    _echo_terminal(render_progress_step(2, 4, "Build and link", build_result.status))
+    _echo_terminal(render_progress_step(3, 5, "Build and link", build_result.status))
     if build_result.status != StageStatus.SUCCEEDED:
         return _merge_deployment_results(results, config)
 
@@ -615,8 +674,8 @@ def _run_live_deployment(
     network_data = generated_model_directory / "network_data.hex"
     _echo_terminal(
         render_progress_step(
-            3,
             4,
+            5,
             "Board programming",
             "running",
             "Flashing FSBL, application, and network data",
@@ -633,7 +692,7 @@ def _run_live_deployment(
         model_path=selected_model,
     )
     results.append(program_result)
-    _echo_terminal(render_progress_step(3, 4, "Board programming", program_result.status))
+    _echo_terminal(render_progress_step(4, 5, "Board programming", program_result.status))
     if program_result.status == StageStatus.FAILED:
         return _merge_deployment_results(results, config)
 
@@ -654,7 +713,7 @@ def _run_live_deployment(
         return _merge_deployment_results(results, config)
 
     _echo_terminal(
-        render_progress_step(4, 4, "UART validation", "running", "Reading inference telemetry")
+        render_progress_step(5, 5, "UART validation", "running", "Reading inference telemetry")
     )
     validate_result = deployer.validate_serial(
         NucleoDeploymentConfig(
@@ -667,11 +726,54 @@ def _run_live_deployment(
         minimum_inferences=inference_count,
         capture_seconds=capture_seconds,
         expected_model_name=expected_model_name or selected_model.stem,
-        expected_input_fnv1a=expected_input_fnv1a,
+        expected_input_fnv1a=(
+            expected_input_fnv1a or _default_fixed_input_hash(application)
+            if fixed_input
+            else expected_input_fnv1a
+        ),
     )
     results.append(validate_result)
-    _echo_terminal(render_progress_step(4, 4, "UART validation", validate_result.status))
+    _echo_terminal(render_progress_step(5, 5, "UART validation", validate_result.status))
     return _merge_deployment_results(results, config)
+
+
+def _resolve_core_directory(core_directory: Path | None) -> Path:
+    resolved = core_directory or (
+        Path(value) if (value := os.getenv("STEDGEAI_CORE_DIR")) else None
+    )
+    if resolved is None:
+        raise typer.BadParameter(
+            "--deploy requires --core-directory or STEDGEAI_CORE_DIR so the generated model "
+            "and application runtime can be verified."
+        )
+    return resolved
+
+
+def _default_fixed_input_hash(application: DeploymentApplication) -> str:
+    return (
+        "0xfbe51dc5" if application == DeploymentApplication.IMAGE_CLASSIFICATION else "0x6c3e9dc5"
+    )
+
+
+def _deployment_preparation_failure(
+    config: NucleoDeploymentConfig,
+    reason: str,
+) -> DeploymentResult:
+    return DeploymentResult(
+        status=StageStatus.FAILED,
+        application=config.application,
+        board=config.expected_board,
+        serial_port=config.serial_port,
+        boot_mode=config.boot_mode,
+        stages=[
+            DeploymentStage(
+                stage=DeploymentStageName.INITIALIZATION,
+                status=StageStatus.FAILED,
+                first_error=reason,
+            )
+        ],
+        reason=reason,
+    )
 
 
 def _selected_deployment_model(

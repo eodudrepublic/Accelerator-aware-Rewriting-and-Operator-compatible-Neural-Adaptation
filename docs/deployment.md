@@ -14,6 +14,29 @@ inference 검증을 서로 다른 단계로 기록한다. programming 성공만�
 `generate`는 Core 4.0.1로 model-specific C source와 external-flash용 `network_data.hex`를
 만들며, 실행 명령과 checksum을 함께 보존한다.
 
+`arona optimize --deploy`는 배포 전에 다음 준비를 자동으로 수행한다.
+
+1. `--core-directory` 또는 `STEDGEAI_CORE_DIR`의 Core 버전과 application runtime을 확인하고
+   필요한 runtime 파일을 동기화함
+2. UART telemetry가 없으면 멱등 방식으로 자동 삽입함
+3. 선택한 application의 `app_config.h`를 생성함
+4. `--fixed-input` 또는 `--camera-input` 선택을 application source에 적용함
+5. 준비가 완료된 경우에만 generate, build, program, validate를 순서대로 실행함
+
+카메라가 없는 환경에서는 `--fixed-input`을 사용한다. 이 경우 application별 기본 FNV-1a
+checksum도 validation 조건으로 자동 적용한다. 대화형 런처의 `Optimize and deploy` 작업은
+Core 경로와 입력 모드를 실행 전에 질문한다.
+
+```powershell
+arona optimize models/downloads/mobilenetv2_a035_128_food101_qdq.onnx `
+  --deploy `
+  --core-directory C:\ST\STEdgeAI2\4.0 `
+  --fixed-input `
+  --application-directory outputs/vendor/STM32N6-GettingStarted-ImageClassification/Application/NUCLEO-N657X0-Q `
+  --model-support-directory outputs/vendor/STM32N6-GettingStarted-ImageClassification/Model `
+  --fsbl outputs/vendor/STM32N6-GettingStarted-ImageClassification/FSBL/ai_fsbl.hex
+```
+
 ```powershell
 arona deployment generate `
   --application image_classification `

@@ -77,7 +77,13 @@ def test_deploy_launcher_uses_selected_application_paths(monkeypatch, tmp_path: 
     model.touch()
 
     monkeypatch.setattr(interactive, "_prompt_existing_file", lambda *args, **kwargs: model)
+    monkeypatch.setattr(
+        interactive,
+        "_prompt_existing_directory",
+        lambda *args, **kwargs: tmp_path / "core",
+    )
     monkeypatch.setattr(interactive, "_select_application", lambda: "object_detection")
+    monkeypatch.setattr(interactive, "_select_input_mode", lambda: "fixed")
     monkeypatch.setattr(interactive, "_prompt_value", lambda label, default: default)
 
     arguments = interactive._collect_command("deploy")
@@ -88,6 +94,8 @@ def test_deploy_launcher_uses_selected_application_paths(monkeypatch, tmp_path: 
     assert str(interactive.OBJECT_DETECTION_APPLICATION) in arguments
     assert str(interactive.OBJECT_DETECTION_MODEL) in arguments
     assert str(interactive.OBJECT_DETECTION_FSBL) in arguments
+    assert "--core-directory" in arguments
+    assert "--fixed-input" in arguments
 
 
 def test_deploy_pipeline_completes_every_stage() -> None:

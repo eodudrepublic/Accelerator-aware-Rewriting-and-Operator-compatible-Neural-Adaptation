@@ -228,6 +228,11 @@ def _collect_command(action: str) -> list[str] | None:
 def _collect_deploy_command() -> list[str]:
     model = _prompt_existing_file("ONNX model", suffix=".onnx")
     application = _select_application()
+    core_directory = _prompt_existing_directory(
+        "STEdgeAI Core directory",
+        os.getenv("STEDGEAI_CORE_DIR", "C:\\ST\\STEdgeAI2\\4.0"),
+    )
+    fixed_input = _select_input_mode() == "fixed"
     serial_port = _prompt_value("Serial port", "COM3")
     output = _prompt_value("Output directory", "outputs")
     if application == "image_classification":
@@ -238,12 +243,14 @@ def _collect_deploy_command() -> list[str]:
         application_directory = OBJECT_DETECTION_APPLICATION
         model_directory = OBJECT_DETECTION_MODEL
         fsbl = OBJECT_DETECTION_FSBL
-    return [
+    arguments = [
         "optimize",
         str(model),
         "--target",
         "stedgeai",
         "--deploy",
+        "--core-directory",
+        str(core_directory),
         "--deployment-application",
         application,
         "--application-directory",
@@ -257,6 +264,9 @@ def _collect_deploy_command() -> list[str]:
         "--output-directory",
         output,
     ]
+    if fixed_input:
+        arguments.append("--fixed-input")
+    return arguments
 
 
 def _select_application() -> str:
@@ -267,6 +277,23 @@ def _select_application() -> str:
             ("object_detection", "Object detection"),
         ],
         default="image_classification",
+        style=LAUNCHER_STYLE,
+        symbol=SELECTOR,
+        show_frame=True,
+        bottom_toolbar=FormattedText(
+            [("class:bottom-toolbar.text", "  ↑/↓ move   Enter select   Ctrl+C cancel")]
+        ),
+    )
+
+
+def _select_input_mode() -> str:
+    return choice(
+        message=FormattedText([("class:prompt", "Select the inference input")]),
+        options=[
+            ("fixed", "Deterministic fixed input (recommended without a camera)"),
+            ("camera", "Camera input"),
+        ],
+        default="fixed",
         style=LAUNCHER_STYLE,
         symbol=SELECTOR,
         show_frame=True,
@@ -289,6 +316,17 @@ def _prompt_existing_file(label: str, *, suffix: str | None = None) -> Path:
             return path
         requirement = f"Existing {suffix} file required." if suffix else "Existing file required."
         write_terminal("\n".join(render_notice("Invalid path", [requirement], "failed")))
+
+
+def _prompt_existing_directory(label: str, default: str) -> Path:
+    while True:
+        value = _prompt_value(label, default)
+        path = Path(value.strip().strip('"')).expanduser()
+        if path.is_dir():
+            return path
+        write_terminal(
+            "\n".join(render_notice("Invalid path", ["Existing directory required."], "failed"))
+        )
 
 
 def _prompt_value(label: str, default: str) -> str:
