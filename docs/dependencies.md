@@ -18,8 +18,9 @@
 | NumPy | `>=2.1` | 2.4.6 | tensor fixture 및 수치 비교 |
 | ONNX | `>=1.17` | 1.22.0 | 모델 로딩, 검사, shape inference 및 rewrite |
 | ONNX Runtime | `>=1.20` | 1.28.0 | 원본·변환 모델 출력 동등성 검증 |
+| prompt-toolkit | `>=3.0.52` | 3.0.53 | 화살표 키 선택, 경로 자동완성 및 대화형 CLI |
 | Pydantic | `>=2.10` | 2.13.4 | backend/pipeline/CLI 계약과 JSON Schema 생성 |
-| PyYAML | `>=6.0` | 6.0.3 | 사용자 및 backend 설정 파일 |
+| pyserial | `>=3.5` | 3.5 | ST-LINK 가상 COM 포트 탐지 및 UART telemetry 수집 |
 | Typer | `>=0.15` | 0.27.0 | CLI |
 
 ## Development group
@@ -36,5 +37,6 @@ PyTorch는 neural adaptation을 구현할 때 별도 optional extra로 추가한
 대용량 설치와 불필요한 플랫폼 제약을 피하기 위해 포함하지 않는다. vendor compiler와
 SDK는 PyPI 의존성이 아니므로 backend 환경 조사 문서에서 별도로 버전을 고정한다.
 
-위 resolved version은 2026-07-30에 생성한 `uv.lock`을 기준으로 하며, CLI-only MVP 범위에
-맞춰 2026-07-31에 UI 전용 dependency를 제거했다.
+위 resolved version은 2026-08-26의 Python 3.11 Windows x64 검증 환경과 `uv.lock`을
+기준으로 한다. 현재 소스에서 직접 사용하지 않는 PyYAML은 runtime 직접 의존성에서 제거했으며,
+전체 전이 의존성에는 개발 도구인 pre-commit을 통해 포함될 수 있다.
