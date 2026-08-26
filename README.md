@@ -57,22 +57,77 @@ ARONA는 문서상의 연산자 지원표만 확인하지 않고 실제 제조�
 ## 시스템 구성
 
 ```mermaid
-flowchart TD
-    A["외부 ONNX 모델 입력"] --> B["doctor / discover"]
-    B --> C["ST Edge AI Core 기준 분석"]
-    C --> D["NPU·CPU 배치 및 메모리 적합성 진단"]
-    D --> E["rewrite 후보 생성"]
-    E --> F["ONNX Runtime 출력 동등성 검증"]
-    F --> G["기준·후보 컴파일러 결과 비교"]
-    G --> H{"안전하고 실제 이득이 있는가?"}
-    H -- "예" --> I["후보 모델 선택"]
-    H -- "아니요 또는 적용 불가" --> J["원본 모델 유지"]
-    I --> K["generate → build/sign"]
-    J --> K
-    K --> L["Development boot에서 program"]
-    L --> M["Flash boot로 전환"]
-    M --> N["UART 실기기 검증"]
-    N --> O["JSON·Markdown 보고서"]
+flowchart TB
+    U(["사용자<br/>직접 CLI · 대화형 런처"])
+    M[("ONNX 모델<br/>MobileNetV2 · YOLO26n")]
+
+    subgraph HOST["Windows x64 호스트 · ARONA"]
+        direction TB
+        ENV["환경 및 도구 점검<br/>doctor · discover"]
+        FE["ONNX Frontend<br/>유효성 검사 · shape 추론 · checksum"]
+        BASE["기준 모델 하드웨어 분석<br/>NPU·CPU 배치 · fallback · partition · 메모리"]
+        RW["의미 보존형 rewrite 후보<br/>Terminal ArgMax 외부화"]
+        VAL["이중 검증<br/>출력 동등성 · 후보 재컴파일"]
+        DEC{"배포 조건 충족<br/>동등성 + 컴파일 성공 + 실측 개선"}
+        SEL["최종 모델 선택<br/>후보 채택 / 원본 자동 원복"]
+        DEP["배포 Orchestrator<br/>Generate → Build → Sign → Program"]
+        REP["검증 Evidence 생성<br/>JSON Schema · Markdown · artifact checksum"]
+
+        ENV --> FE --> BASE --> RW --> VAL --> DEC
+        DEC -- "충족" --> SEL
+        DEC -- "미충족" --> SEL
+        SEL --> DEP
+        BASE --> REP
+        VAL --> REP
+    end
+
+    subgraph TOOLS["제조사 및 외부 CLI 도구 체인"]
+        direction TB
+        CORE["ST Edge AI Core 4.0.1<br/>배치 분석 · 모델 코드 생성"]
+        ORT["ONNX Runtime<br/>출력 동등성 검증"]
+        BUILD["GNU Tools for STM32 · Make<br/>STM32 Signing Tool"]
+        PROG["STM32CubeProgrammer CLI<br/>ST-LINK programming"]
+
+        CORE -->|"generated model code"| BUILD
+        BUILD -->|"signed firmware"| PROG
+    end
+
+    subgraph TARGET["타깃 하드웨어 검증"]
+        direction TB
+        DEV["JP2 Development boot<br/>펌웨어 programming"]
+        BOARD["NUCLEO-N657X0-Q<br/>STM32N657 MCU · Neural-ART NPU"]
+        FLASH["JP2 Flash boot<br/>타깃 application 실행"]
+        UART["UART telemetry<br/>모델 ID · 입력 hash · 추론 latency"]
+
+        DEV --> BOARD --> FLASH --> UART
+    end
+
+    U --> ENV
+    M --> FE
+    ENV -. "설치·연결 탐지" .-> TOOLS
+    BASE -. "기준 컴파일" .-> CORE
+    VAL -. "후보 컴파일" .-> CORE
+    VAL -. "수치 동등성" .-> ORT
+    DEP -. "CLI 오케스트레이션" .-> CORE
+    DEP -. "build·sign" .-> BUILD
+    DEP -. "program" .-> PROG
+    PROG --> DEV
+    UART --> REP
+    REP --> R[("재현 가능한 실험 산출물<br/>로그 · 판단 근거 · 실측값")]
+
+    classDef input fill:#EAF2FF,stroke:#2563EB,stroke-width:2px,color:#0F172A;
+    classDef arona fill:#ECFDF5,stroke:#059669,stroke-width:1.5px,color:#064E3B;
+    classDef decision fill:#FFF7ED,stroke:#EA580C,stroke-width:2px,color:#7C2D12;
+    classDef tool fill:#F5F3FF,stroke:#7C3AED,stroke-width:1.5px,color:#4C1D95;
+    classDef target fill:#FEF2F2,stroke:#DC2626,stroke-width:1.5px,color:#7F1D1D;
+    classDef evidence fill:#F8FAFC,stroke:#475569,stroke-width:2px,color:#0F172A;
+
+    class U,M input;
+    class ENV,FE,BASE,RW,VAL,SEL,DEP arona;
+    class DEC decision;
+    class CORE,ORT,BUILD,PROG tool;
+    class DEV,BOARD,FLASH,UART target;
+    class REP,R evidence;
 ```
 
 제조사 종속 로직은 공통 `BackendAdapter` 뒤에 분리하고, ONNX frontend, 최적화 검증, CLI 및 결과 보고 계층은 다른 backend에서도 재사용할 수 있도록 구성했습니다.
