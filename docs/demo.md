@@ -1,6 +1,6 @@
 # ARONA MVP demo
 
-이 문서는 checkpoint 4 제출 후보를 재현할 때 쓰는 짧은 실행 절차다. 저장소에는 ST 모델
+이 문서는 배포 후보를 재현할 때 쓰는 짧은 실행 절차다. 저장소에는 ST 모델
 binary, vendor build output, 보드 flash dump를 넣지 않는다. Git에는 명령, fixture log,
 checksum, JSON/Markdown contract와 재생성 절차만 보존한다.
 
@@ -91,19 +91,19 @@ outputs/demo-runs/<run-id>/
 STM32CubeIDE/CLT와 공식 STM32N6 application checkout이 필요하다. 자세한 wrapper 명령은
 `docs/deployment.md`가 기준이다.
 
-checkpoint 3에서 확인한 보드 실행 증거:
+실기기 회귀 검증에서 확인한 보드 실행 증거:
 
 | Application | Input | Repeated inference evidence |
 | --- | --- | --- |
 | Image classification | fixed 128x128x3 input, FNV-1a `0xfbe51dc5` | 1,021 runs, 2-3 ms, mean 2.643 ms |
 | Object detection | fixed 256x256x3 input, FNV-1a `0x6c3e9dc5` | 618 runs, 20-21 ms, mean 20.937 ms |
 
-checkpoint 4에서는 같은 경로를 fresh generate/build/program으로 다시 검증해 MobileNet 343회
-(평균 2.647 ms), YOLO26n 150회(평균 20.953 ms)를 확인했다. 정확한 toolchain, firmware,
-artifact checksum과 clean-checkout 상태는 [checkpoint 4 E2E evidence](checkpoint4-e2e-evidence.md)에
-고정한다.
+같은 경로를 fresh generate/build/program으로 다시 검증해 MobileNet 343회
+(평균 2.647 ms), YOLO26n 150회(평균 20.953 ms)를 확인했다. 고정된 배포 증거 요약은
+`tests/fixtures/deployment/nucleo_checkpoint4_e2e/evidence.json`에 있으며, 실행별 toolchain,
+firmware와 artifact checksum은 `outputs/` 아래 실행 보고서에 생성된다.
 
-`arona optimize --deploy`는 checkpoint 4에서 STM32N6 `generate -> build -> program -> validate`
+`arona optimize --deploy`는 STM32N6 `generate -> build -> program -> validate`
 sequence를 직접 실행한다. Programming이 끝나면 CLI가 멈추므로, 안내에 따라 JP2를 position 1
 (Flash boot)로 옮기고 보드 전원을 다시 연결해 COM 포트가 복구된 뒤 확인 입력을 한다. 이미
 생성된 `arona deployment validate` 결과를 재사용해야 할 때만 `--deployment-result`를 전달한다.
@@ -125,8 +125,8 @@ uv run arona optimize `
 ```
 
 이 명령의 `report.md`에는 compiler before/after, rewrite validation, final decision과 board
-deployment status가 함께 표시된다. `outputs/checkpoint3/`는 로컬 evidence라 clean checkout에는
-없을 수 있으며, 없으면 `docs/deployment.md` 절차로 다시 생성한다.
+deployment status가 함께 표시된다. 로컬 `outputs/` evidence는 clean checkout에는 없을 수 있으며,
+없으면 `docs/deployment.md` 절차로 다시 생성한다.
 
 ## 5. Known limits for the release candidate
 
@@ -134,5 +134,5 @@ deployment status가 함께 표시된다. `outputs/checkpoint3/`는 로컬 evide
   `--deploy` live sequence다.
 - 저장소 fixture는 재배포 가능한 log/JSON/metadata만 포함한다. 모델 binary와 vendor output은
   checksum과 생성 절차로 대체한다.
-- checkpoint 3 보드 실행은 fixed-input smoke evidence다. baseline/optimized latency를 같은 조건에서
+- 보드 실행 결과는 fixed-input smoke evidence다. baseline/optimized latency를 같은 조건에서
   20회씩 비교하는 성능 실험은 아직 남아 있다.
