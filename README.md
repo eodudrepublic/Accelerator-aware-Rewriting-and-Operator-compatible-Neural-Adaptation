@@ -143,7 +143,7 @@ flowchart TB
 
 YOLO26n의 순수 소프트웨어 epoch 14개는 Conv 8개, DequantizeLinear 1개, QuantizeLinear 2개, Softmax 2개, float Sub 1개이며 하나의 CPU partition과 한 번의 NPU·CPU 전환을 형성했습니다. 하드웨어가 관여하는 순수 HW와 hybrid epoch을 합치면 162/176, 약 92.0%이지만 이를 순수 NPU 배치율로 해석하지 않습니다.
 
-위 결과는 fixed-input에서 생성된 firmware가 중단 없이 반복 추론되고 참고 latency 수준과 일관됨을 검증한 것입니다. 카메라 촬영, 전·후처리를 포함한 application 전체 처리량이나 Food-101·COCO-Person 정확도를 측정한 결과는 아닙니다. 자세한 제출 기준 설명은 [`1차 제출 결과보고서.md`](./1차%20제출%20결과보고서.md)를 참고하십시오.
+위 결과는 fixed-input에서 생성된 firmware가 중단 없이 반복 추론되고 참고 latency 수준과 일관됨을 검증한 것입니다. 카메라 촬영, 전·후처리를 포함한 application 전체 처리량이나 Food-101·COCO-Person 정확도를 측정한 결과는 아닙니다.
 
 ## Windows x64 설치 및 실행 가이드
 
@@ -510,14 +510,13 @@ uv run pytest --cov=arona --cov-report=term
 - JP2 Development/Flash boot 전환과 USB 재연결은 사용자가 물리적으로 수행해야 합니다.
 - ST Edge AI Core와 STM32 programmer/build toolchain은 사용자가 별도로 설치해야 합니다.
 
-최종 제출까지 model manifest와 application 설정을 일반화하고 더 다양한 분류·검출 모델, board profile과 제조사 backend를 연결할 계획입니다. 장기적으로는 정확도 손실, latency, RAM, Flash 및 전력 조건을 입력받아 양자화, pruning, channel 축소와 연산 블록 치환 후보를 생성하고, 실제 컴파일러와 보드 측정으로 가장 적합한 모델을 자동 선택하는 하드웨어 인지형 경량화 기능을 목표로 합니다.
+향후 model manifest와 application 설정을 일반화하고 더 다양한 분류·검출 모델, board profile과 제조사 backend를 연결할 계획입니다. 장기적으로는 정확도 손실, latency, RAM, Flash 및 전력 조건을 입력받아 양자화, pruning, channel 축소와 연산 블록 치환 후보를 생성하고, 실제 컴파일러와 보드 측정으로 가장 적합한 모델을 자동 선택하는 하드웨어 인지형 경량화 기능을 목표로 합니다.
 
 ## 문서
 
 - [MVP 시연 절차](docs/demo.md)
-- [Windows E2E 설치·검증 기록](docs/windows-e2e-setup-validation.md)
+- [STM32N6 배포 절차](docs/deployment.md)
 - [NUCLEO-N657X0-Q 연결 및 복구 매뉴얼](docs/nucleo-n657x0-q-agent-manual.md)
-- [ST Edge AI backend](docs/backends/stedgeai.md)
 - [실행 결과 JSON 계약](docs/contracts/backend-cli.md)
 - [개발 환경 및 품질 검사](docs/development.md)
 - [의존성 및 라이선스](docs/dependencies.md)
